@@ -64,114 +64,123 @@ const GENERATIVE_MODELS = [
   "gemini-2.5-pro",
 ];
 
-async function generateWithFallback(prompt: string, requireJson: boolean = false): Promise<string> {
+async function generateWithFallback(
+  prompt: string,
+  requireJson: boolean = false,
+  temperature: number = 0.7
+): Promise<string> {
   for (const modelName of GENERATIVE_MODELS) {
     try {
       logger.info(`Trying model: ${modelName}`);
-      
-      // Dynamic config so we can use this for both regular chat AND JSON quizzes
-      const modelOptions: any = { model: modelName };
-      if (requireJson) {
-        modelOptions.generationConfig = { responseMimeType: "application/json" };
-      }
+
+      const modelOptions: any = {
+        model: modelName,
+        generationConfig: {
+          temperature,
+          ...(requireJson && { responseMimeType: "application/json" })
+        }
+      };
 
       const model = genAI.getGenerativeModel(modelOptions);
       const result = await model.generateContent(prompt);
       return result.response.text();
     } catch (error: any) {
-      const is429 = error?.message?.includes('429') || 
+      const is429 = error?.message?.includes('429') ||
                     error?.message?.includes('quota') ||
                     error?.message?.includes('Too Many Requests');
-      
       if (is429) {
         logger.info(`Model ${modelName} quota exceeded — shifting to next model...`);
-        continue; // Try next model
+        continue;
       }
-      
-      // Non-quota error — throw immediately, don't try other models
       throw error;
     }
   }
-  
   throw new Error("All models quota exceeded. Please try again later.");
 }
 
 // ============================================================================
-// ── 3. SECURITY & MIDDLEWARE ────────────────────────────────────────────────
+// ── 3. SECURITY & MIDDLEWARE ─────────────────────────────────────────────────
 // ============================================================================
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:", "https:"],
-      scriptSrc: ["'self'"],
-    },
-  },
-  crossOriginEmbedderPolicy: true,
-  crossOriginOpenerPolicy: { policy: "same-origin" },
-  crossOriginResourcePolicy: { policy: "same-origin" },
-}));
 
-app.use(express.json({ limit: CONFIG.BODY_SIZE_LIMIT }));
-app.set('trust proxy', 1);
-
-const allowedOrigins = IS_PROD
-  ? (process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()) || [])
-  : ['http://localhost:5173', 'http://127.0.0.1:5173'];
-
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin && !IS_PROD) return callback(null, true);
-    if (origin && allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS: Origin ${origin} not permitted`));
-  },
-  methods: ['POST', 'GET', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
-
-const getClientIP = (req: Request): string =>
-  req.ip?.replace(/^::ffff:/, '') || req.socket.remoteAddress || 'unknown';
-
+// ── Rate Limiter ─────────────────────────────────────────────────────────────
 const limiter = rateLimit({
   windowMs: CONFIG.RATE_LIMIT_WINDOW_MS,
   max: CONFIG.RATE_LIMIT_MAX,
-  keyGenerator: getClientIP,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { error: "Cool your engines! Too many requests. Try again in a minute." },
+  message: { error: "Too many requests. Please slow down." }
 });
 
-const requireAuth = (req: Request, res: Response, next: NextFunction) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: "Unauthorized — missing token." });
-  }
-  const token = authHeader.replace('Bearer ', '').trim();
-  const tokenBuffer = Buffer.from(token);
-  const validBuffer = Buffer.from(process.env.API_AUTH_TOKEN!);
-  if (tokenBuffer.length !== validBuffer.length || !crypto.timingSafeEqual(tokenBuffer, validBuffer)) {
-    return res.status(401).json({ error: "Unauthorized — invalid token." });
-  }
-  next();
-};
+// ── Auth Middleware ───────────────────────────────────────────────────────────
+function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const requestId = crypto.randomUUID();
-  res.setHeader('X-Request-ID', requestId);
-  (req as any).requestId = requestId;
-  next();
-});
+  if (!token) {
+    res.status(401).json({ error: "Unauthorized: No token provided." });
+    return;
+  }
 
+  const validToken = process.env.API_AUTH_TOKEN!;
+  const isValid = crypto.timingSafeEqual(
+    Buffer.from(token.padEnd(64)),
+    Buffer.from(validToken.padEnd(64))
+  );
+
+  if (!isValid) {
+    res.status(403).json({ error: "Forbidden: Invalid token." });
+    return;
+  }
+
+  (req as any).requestId = crypto.randomUUID();
+  next();
+}
+
+const allowedOrigins = IS_PROD
+  ? (process.env.ALLOWED_ORIGINS?.split(',').map(o => o.trim()).filter(Boolean) || [])
+  : [
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+      'http://localhost:3000',
+      'http://localhost:5174'
+    ];
+
+function isAllowedOrigin(origin: string | undefined): boolean {
+  if (!origin) return true;
+  if (allowedOrigins.includes(origin)) return true;
+  for (const allowed of allowedOrigins) {
+    if (allowed.startsWith('*.') && origin.endsWith(allowed.slice(1))) return true;
+  }
+  return false;
+}
+
+app.use(helmet());
+app.use(express.json({ limit: CONFIG.BODY_SIZE_LIMIT }));
+app.use(cors({
+  origin: (origin, callback) => {
+    const decision = isAllowedOrigin(origin) ? '✅ ALLOWED' : '❌ BLOCKED';
+    logger.info(`CORS [${decision}] → Origin: ${origin || 'undefined'} | Env: ${IS_PROD ? 'prod' : 'dev'}`);
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    logger.error(`CORS blocked origin: ${origin || 'undefined'}`,
+      new Error(`CORS: Origin ${origin || 'undefined'} not permitted`));
+    return callback(new Error(`CORS: Origin ${origin || 'undefined'} not permitted`));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+  credentials: true,
+  maxAge: 86400,
+  optionsSuccessStatus: 204
+}));
 
 // ============================================================================
 // ── 4. ROUTES ───────────────────────────────────────────────────────────────
 // ============================================================================
 
 app.get('/health', (_req: Request, res: Response) => {
-  res.json({ status: "ok", service: "Sora Backend", version: "3.0.0 (Fallback Enabled)",
-    environment: IS_PROD ? 'production' : 'development' });
+  res.json({
+    status: "ok", service: "Sora Backend", version: "3.0.0 (Fallback Enabled)",
+    environment: IS_PROD ? 'production' : 'development'
+  });
 });
 
 // --- CORE RAG ENGINE: ASK SORA ---
@@ -222,12 +231,11 @@ QUESTION:
 ${message.trim()}
     `;
 
-    // ── STEP 6: Generate answer with fallback ─────────────────────────────────
     logger.info("Generating answer with Fallback Chain", { requestId });
-    const answer = await generateWithFallback(systemPrompt, false);
+    const answer = await generateWithFallback(systemPrompt, false, 0.4);
 
     return res.json({
-      answer: answer,
+      answer,
       citations: matchedRules.map((r: any) => ({ rule_id: r.rule_id, content: r.content })),
     });
 
@@ -250,12 +258,12 @@ app.post('/generate_quiz', requireAuth, limiter, async (req: Request, res: Respo
     const embedResult = await embeddingModel.embedContent({
       content: { parts: [{ text: topic }], role: "user" },
       taskType: "RETRIEVAL_QUERY" as any,
-      outputDimensionality: 768 
+      outputDimensionality: 768
     } as any);
 
     const { data: matchedRules, error: supabaseError } = await supabase.rpc('match_rulebook_chunks', {
       query_embedding: embedResult.embedding.values,
-      match_threshold: 0.3, 
+      match_threshold: 0.3,
       match_count: CONFIG.QUIZ_MATCH_COUNT,
       filter_domain: domain
     });
@@ -269,6 +277,7 @@ app.post('/generate_quiz', requireAuth, limiter, async (req: Request, res: Respo
     const prompt = `
 You are the Chief Scrutineer for Formula Bharat 2027.
 Generate exactly 3 multiple-choice questions based ONLY on the provided rules.
+Vary the question types — mix conceptual understanding, numerical/specification recall, and rule application scenarios.
 
 RULES CONTEXT:
 ${contextText}
@@ -276,6 +285,7 @@ ${contextText}
 REQUIREMENTS:
 - The questions must be highly technical and specific to the rules provided.
 - Make the wrong options plausible but clearly incorrect according to the rule.
+- Do NOT repeat the same question style for all 3 questions.
 - Output the result strictly as a JSON array.
 
 JSON SCHEMA EXPECTED:
@@ -289,10 +299,9 @@ JSON SCHEMA EXPECTED:
 ]
     `;
 
-    // ── STEP 6: Generate JSON quiz with fallback ─────────────────────────────
     logger.info("Generating JSON Quiz with Fallback Chain", { requestId });
-    const answer = await generateWithFallback(prompt, true); // true forces JSON config!
-    
+    const answer = await generateWithFallback(prompt, true, 1.2);
+
     const quizData = JSON.parse(answer);
 
     logger.info("Quiz generated successfully", { requestId });
