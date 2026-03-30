@@ -19,6 +19,11 @@ requiredEnvVars.forEach(v => {
 });
 
 const app = express();
+
+// 🚨 CRITICAL FIX FOR RENDER: Tells Express to look at the real user's IP, 
+// not the Render Load Balancer IP. Prevents the whole team from getting rate-limited.
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 8000;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
@@ -91,7 +96,7 @@ async function saveLearnedPair(
     }]);
 
     if (error) logger.error("saveLearnedPair insert failed", error);
-    else logger.info(`Learned pair saved [source: ${source}]`);
+    else logger.info(`Learned pair saved `);
   } catch (err) {
     logger.error("saveLearnedPair threw", err);
   }
@@ -166,7 +171,6 @@ Query: ${rawQuery}`;
   }
 }
 
-// ── Greeting detection ───────────────────────────────────────────────────────
 const GREETING_PATTERNS = [
   /^(hi+|hello+|hey+|hiya|howdy|sup|yo+)[\s!?.]*$/i,
   /^what'?s\s+up[\s!?.]*$/i,
@@ -194,7 +198,7 @@ function randomGreeting(): string {
 }
 
 // ============================================================================
-// ── 4. SECURITY & MIDDLEWARE ─────────────────────────────────────────────────
+// ── 4. SECURITY & TEAM AUTHENTICATION ────────────────────────────────────────
 // ============================================================================
 
 const limiter = rateLimit({
@@ -205,7 +209,8 @@ const limiter = rateLimit({
   message: { error: "Too many requests. Please slow down." }
 });
 
-function requireAuth(req: Request, res: Response, next: NextFunction): void {
+// 🚀 UPGRADED AUTH: Supports both Master Token (Local testing) AND Team Member Approval
+async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers['authorization'];
   const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
@@ -214,19 +219,55 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
     return;
   }
 
-  const validToken = process.env.API_AUTH_TOKEN!;
-  const tokenBuf = Buffer.alloc(128);
-  const validBuf = Buffer.alloc(128);
-  tokenBuf.write(token);
-  validBuf.write(validToken);
+  // 1. Check if it's the Master API Token (Keeps your current React UI working)
+  try {
+    const validToken = process.env.API_AUTH_TOKEN!;
+    const tokenBuf = Buffer.alloc(128);
+    const validBuf = Buffer.alloc(128);
+    tokenBuf.write(token.substring(0, 128));
+    validBuf.write(validToken.substring(0, 128));
 
-  if (!crypto.timingSafeEqual(tokenBuf, validBuf)) {
-    res.status(403).json({ error: "Forbidden: Invalid token." });
-    return;
+    if (crypto.timingSafeEqual(tokenBuf, validBuf)) {
+      (req as any).requestId = crypto.randomUUID();
+      (req as any).user = { role: 'admin' };
+      return next(); // Master Token verified, bypass team check!
+    }
+  } catch (err) {
+    // Fails safely, moves to check if it's a Supabase Team JWT
   }
 
-  (req as any).requestId = crypto.randomUUID();
-  next();
+  // 2. If it's NOT the master token, verify it as a Supabase JWT (For team members)
+  try {
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+
+    if (authError || !user) {
+      res.status(401).json({ error: "Unauthorized: Invalid or expired session." });
+      return;
+    }
+
+    // 3. Check if Aakash approved them in the hexawatts_team table
+    const { data: teamMember, error: dbError } = await supabase
+      .from('hexawatts_team')
+      .select('is_approved, email')
+      .eq('id', user.id)
+      .single();
+
+    if (dbError || !teamMember || teamMember.is_approved === false) {
+      res.status(403).json({ 
+        error: "ACCOUNT_PENDING", 
+        message: "Welcome to Hexawatts! Your account is pending. Tell Aakash to approve your access." 
+      });
+      return;
+    }
+
+    // 4. Team Member Verified!
+    (req as any).requestId = crypto.randomUUID();
+    (req as any).user = { id: user.id, email: teamMember.email };
+    next();
+  } catch (err) {
+    logger.error("Auth Middleware Error", err);
+    res.status(500).json({ error: "Authentication system offline." });
+  }
 }
 
 const allowedOrigins = IS_PROD
@@ -268,7 +309,7 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     service: "Sora Backend",
-    version: "6.0.0",
+    version: "7.0.0 (Team Auth Ready)",
     environment: IS_PROD ? 'production' : 'development'
   });
 });
@@ -287,7 +328,6 @@ app.post('/ask_sora', requireAuth, limiter, async (req: Request, res: Response) 
 
   logger.info("Incoming query", { requestId, domain: sanitizedDomain });
 
-  // ── Greeting shortcut ────────────────────────────────────────────────────
   if (isGreeting(trimmedMessage)) {
     const reply = randomGreeting();
     await saveLog({ question: trimmedMessage, answer: reply, domain: sanitizedDomain, was_greeted: true });
@@ -295,12 +335,10 @@ app.post('/ask_sora', requireAuth, limiter, async (req: Request, res: Response) 
   }
 
   try {
-    // ── Step 1: Embed raw query first ────────────────────────────────────
     let queryToUse = trimmedMessage;
     let wasSpellCorrected = false;
     let embedding = await embedQuery(queryToUse);
 
-    // ── Step 2: First pass — rulebook vector search ──────────────────────
     let { data: matchedRules, error: supabaseError } = await supabase.rpc('match_rulebook_chunks', {
       query_embedding: embedding,
       match_threshold: CONFIG.MATCH_THRESHOLD,
@@ -310,7 +348,6 @@ app.post('/ask_sora', requireAuth, limiter, async (req: Request, res: Response) 
 
     if (supabaseError) throw new Error("Database search failed");
 
-    // ── Step 3: Lazy spell correction — only if results are weak ────────
     const bestScore = matchedRules?.[0]?.similarity ?? 0;
     if (!matchedRules || matchedRules.length === 0 || bestScore < CONFIG.TYPO_SCORE_THRESHOLD) {
       logger.info(`Weak match (score: ${bestScore}) — attempting spell correction`, { requestId });
@@ -336,7 +373,6 @@ app.post('/ask_sora', requireAuth, limiter, async (req: Request, res: Response) 
       }
     }
 
-    // ── Step 4: Search learned Q&A pairs (always runs) ──────────────────
     const { data: learnedMatches } = await supabase.rpc('match_learned_chunks', {
       query_embedding: embedding,
       match_threshold: CONFIG.LEARNED_MATCH_THRESHOLD,
@@ -347,7 +383,6 @@ app.post('/ask_sora', requireAuth, limiter, async (req: Request, res: Response) 
     const hasRuleMatches = matchedRules && matchedRules.length > 0;
     const hasLearnedMatches = learnedMatches && learnedMatches.length > 0;
 
-    // ── Step 5: No results in either source — return early ───────────────
     if (!hasRuleMatches && !hasLearnedMatches) {
       const noMatchReply = wasSpellCorrected
         ? `I tried interpreting your question as *"${queryToUse}"* but still couldn't find a matching rule. Could you try rephrasing it?`
@@ -364,7 +399,6 @@ app.post('/ask_sora', requireAuth, limiter, async (req: Request, res: Response) 
       return res.json({ answer: noMatchReply, citations: [] });
     }
 
-    // ── Step 6: Build context from whatever sources have data ────────────
     const ruleContext = hasRuleMatches
       ? matchedRules.map((r: any) => `[Rule ID: ${r.rule_id}]\n${r.content}`).join("\n\n---\n\n")
       : "No direct rulebook match found for this query.";
@@ -374,7 +408,6 @@ app.post('/ask_sora', requireAuth, limiter, async (req: Request, res: Response) 
         learnedMatches.map((l: any) => `Q: ${l.question}\nA: ${l.answer}`).join("\n\n")
       : "";
 
-    // ── Step 7: Generate answer ──────────────────────────────────────────
     const systemPrompt = `
 You are Sora, the expert AI Technical Inspector for Hexawatts Racing (Formula Bharat 2027).
 
@@ -398,7 +431,6 @@ ${wasSpellCorrected ? `(Note: original query was "${trimmedMessage}", auto-corre
     logger.info("Generating answer", { requestId });
     const answer = await generateWithFallback(systemPrompt, false, 0.45);
 
-    // ── Step 8: Log interaction ──────────────────────────────────────────
     await saveLog({
       question: trimmedMessage,
       cleaned_question: wasSpellCorrected ? queryToUse : undefined,
@@ -407,7 +439,6 @@ ${wasSpellCorrected ? `(Note: original query was "${trimmedMessage}", auto-corre
       matched_rule_ids: hasRuleMatches ? matchedRules.map((r: any) => r.rule_id) : []
     });
 
-    // ── Step 9: Auto-save high confidence answers to learned table ───────
     if (bestScore >= 0.75) {
       saveLearnedPair(queryToUse, answer, sanitizedDomain, 'auto_high_confidence').catch(() => {});
     }
@@ -529,7 +560,7 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction) => {
 app.listen(PORT, () => {
   console.log(`\n🏁 Sora Backend live at http://localhost:${PORT}`);
   console.log(`🌍 Environment : ${IS_PROD ? 'production' : 'development'}`);
-  console.log(`🔒 Security    : Helmet & Timing-Safe Auth Active`);
+  console.log(`🔒 Security    : Helmet & Dual-Auth Active (Team + Master)`);
   console.log(`🛡️  Fallback    : Waterfall generation enabled`);
   console.log(`📝 Logging     : Supabase sora_logs active`);
   console.log(`🧠 Learning    : sora_learned table active`);
