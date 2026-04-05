@@ -14,8 +14,7 @@
     "noEmit": true,
     "jsx": "react-jsx",
 
-    /* THE FIX: Paths & BaseUrl */
-    "baseUrl": ".",
+    /* Paths - baseUrl removed, handled by Vite alias instead */
     "paths": {
       "@/*": ["./src/*"]
     },
