@@ -605,7 +605,7 @@ const generalLimiter = rateLimit({
 app.use(helmet());
 app.use(express.json({ limit: CONFIG.BODY_SIZE_LIMIT }));
 app.use(cors({
-  origin: IS_PROD ? (process.env.FRONTEND_URL ?? 'https://your-frontend.com') : '*',
+  origin: IS_PROD ? (process.env.FRONTEND_URL ?? 'https://peggy-snowy.vercel.app/') : '*',
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
