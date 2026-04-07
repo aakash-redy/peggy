@@ -14,42 +14,6 @@ dotenv.config();
 // ── 1. CONFIGURATION & STARTUP CHECKS
 // ============================================================================
 
-/**
- * MODEL ROTATION STRATEGY
- * ─────────────────────────────────────────────────────────────────────────
- * You have 2 API keys:
- *   GEMINI_API_KEY       → primary key  (generation + embeddings)
- *   GEMINI_RERANK_API_KEY → rerank key (dedicated to LLM reranking only)
- *
- * Each key has multiple models available, each with its own quota bucket.
- * The engine works like this:
- *
- *   PRIMARY KEY  ─► try gemini-2.5-flash   (fastest, highest quota tier)
- *                        │ 429/quota?
- *                        ▼
- *                   try gemini-2.0-flash
- *                        │ 429/quota?
- *                        ▼
- *                   try gemini-2.0-flash-lite
- *                        │ 429/quota?
- *                        ▼
- *                        │ all exhausted?
- *                        ▼
- *                   throw QUOTA_EXHAUSTED
- *
- *   RERANK KEY   → same cascade, but isolated so reranking never eats
- *                  your primary key's generation quota.
- *                  Falls back to primary key's cascade if all rerank
- *                  models are also exhausted.
- *
- * Each model's quota state is tracked independently (cooldown circuit
- * breaker). When a model cools down it becomes eligible again automatically.
- *
- * .env setup:
- *   GEMINI_API_KEY=AIza...          ← your main key
- *   GEMINI_RERANK_API_KEY=AIza...   ← your second key
- */
-
 const requiredEnvVars = [
   'SUPABASE_URL',
   'SUPABASE_ANON_KEY',
@@ -82,12 +46,6 @@ const CONFIG = {
   ASK_RATE_LIMIT_MAX: IS_PROD ? 10 : 30,
   BODY_SIZE_LIMIT: '10kb',
   EMBEDDING_MODEL: 'models/gemini-embedding-001',
-
-  /**
-   * Model cooldown: after a 429, that specific model is skipped for this
-   * many ms before being retried. Set low (60s) because Gemini quotas
-   * reset on a per-minute rolling window for most free-tier models.
-   */
   MODEL_COOLDOWN_MS: 60 * 1000,
 } as const;
 
@@ -97,38 +55,22 @@ const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_AN
 // ── 2. MODEL ROSTER & PER-MODEL CIRCUIT BREAKER
 // ============================================================================
 
-/**
- * ModelSlot — one model on one API key.
- *
- * Each slot tracks its own quota state independently.
- * This means gemini-2.5-flash and gemini-2.0-flash have separate cooldowns
- * on the same key, so hitting flash's quota doesn't block flash-lite.
- */
 interface ModelSlot {
-  label: string;          // human-readable, e.g. "PRIMARY/gemini-2.5-flash"
-  modelName: string;      // exact string passed to the Gemini SDK
+  label: string;
+  modelName: string;
   client: GoogleGenerativeAI;
-  coolUntil: number;      // epoch ms; 0 = always eligible
-  quotaHits: number;      // lifetime counter for observability
-  successCount: number;   // lifetime counter for observability
+  coolUntil: number;
+  quotaHits: number;
+  successCount: number;
 }
 
-/**
- * Build an ordered list of ModelSlots for one API key.
- * Models are listed fastest/most-capable first. When a model's quota is
- * hit its slot is cooled and the next model in the list is tried.
- */
 function buildModelRoster(apiKey: string, keyLabel: string): ModelSlot[] {
   const client = new GoogleGenerativeAI(apiKey);
-
-  // Order matters: best first, degrade gracefully on quota.
-  // gemini-1.5-flash removed — 404 on v1beta (not supported for generateContent).
   const models = [
-    'gemini-2.5-flash',       // Best — tried first
-    'gemini-2.0-flash',       // Main fallback
-    'gemini-2.0-flash-lite',  // Cheapest quota bucket — last resort
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-2.0-flash-lite',
   ];
-
   return models.map(modelName => ({
     label: `${keyLabel}/${modelName}`,
     modelName,
@@ -139,50 +81,33 @@ function buildModelRoster(apiKey: string, keyLabel: string): ModelSlot[] {
   }));
 }
 
-// Primary roster: used for generation, embeddings, intent classification, etc.
-const primaryRoster: ModelSlot[] = buildModelRoster(
-  process.env.GEMINI_API_KEY!,
-  'PRIMARY',
-);
+const primaryRoster: ModelSlot[] = buildModelRoster(process.env.GEMINI_API_KEY!, 'PRIMARY');
+const rerankRoster: ModelSlot[]  = buildModelRoster(process.env.GEMINI_RERANK_API_KEY!, 'RERANK');
 
-// Rerank roster: dedicated second key, used only for LLM reranking.
-const rerankRoster: ModelSlot[] = buildModelRoster(
-  process.env.GEMINI_RERANK_API_KEY!,
-  'RERANK',
-);
-
-/** Returns slots that are not currently cooling down. */
 function activeSlots(roster: ModelSlot[]): ModelSlot[] {
   const now = Date.now();
   const active = roster.filter(s => s.coolUntil <= now);
-  // If everything is cooling, return full list so callers can surface a proper error.
   return active.length > 0 ? active : roster;
 }
 
-/** Cool a slot after a quota hit. */
 function coolSlot(slot: ModelSlot): void {
   slot.quotaHits++;
   slot.coolUntil = Date.now() + CONFIG.MODEL_COOLDOWN_MS;
   logger.warn(`[ROSTER] ${slot.label} quota hit #${slot.quotaHits}. Cooling ${CONFIG.MODEL_COOLDOWN_MS / 1000}s.`);
 }
 
-/**
- * True if the error means we should skip this model and try the next one.
- * Covers quota/rate-limit errors AND model-not-found (404) errors — both
- * mean "this model can't serve this request right now, move on".
- */
 function isSkippableError(error: unknown): boolean {
   const msg = error instanceof Error ? error.message : String(error);
   const lower = msg.toLowerCase();
   return (
-    msg.includes('429')                      ||  // rate limited
-    lower.includes('quota')                  ||  // quota exceeded
-    lower.includes('resource_exhausted')     ||  // gRPC quota
-    lower.includes('rate_limit')             ||  // rate limit variant
-    msg.includes('404')                      ||  // model not found / not available
-    lower.includes('not found')              ||  // model not found text
-    lower.includes('is not supported')       ||  // unsupported method
-    lower.includes('not supported for generatecontent')  // specific SDK message
+    msg.includes('429')                                  ||
+    lower.includes('quota')                              ||
+    lower.includes('resource_exhausted')                 ||
+    lower.includes('rate_limit')                         ||
+    msg.includes('404')                                  ||
+    lower.includes('not found')                          ||
+    lower.includes('is not supported')                   ||
+    lower.includes('not supported for generatecontent')
   );
 }
 
@@ -228,6 +153,12 @@ interface ModelRecord {
   [key: string]: unknown;
 }
 
+interface CadNodeMatch {
+  rule_id: string;
+  cad_node_name: string;
+  relevance_score?: number;
+}
+
 type QueryIntent = 'dimension' | 'compliance' | 'definition' | 'procedure' | 'general';
 
 // ============================================================================
@@ -265,7 +196,6 @@ function writeCache(embedding: number[], domain: string, response: Record<string
   semanticCache.set(key, { embedding, response, expiresAt: Date.now() + CONFIG.CACHE_TTL_MS });
 }
 
-// Prune expired entries every 10 minutes
 setInterval(() => {
   const now = Date.now();
   let pruned = 0;
@@ -319,31 +249,6 @@ async function saveLearnedPair(
 // ── 6. CORE AI ENGINE — PER-MODEL ROTATION
 // ============================================================================
 
-/**
- * generateWithRoster
- * ─────────────────────────────────────────────────────────────────────────
- * Works through a ModelSlot roster in order. Each slot is one model on one
- * API key. When a slot hits a quota error it is cooled and the next slot is
- * tried. Non-quota errors are rethrown immediately so real bugs surface.
- *
- * Example with primaryRoster (4 slots):
- *
- *   Request arrives
- *       │
- *       ▼
- *   PRIMARY/gemini-2.5-flash  ──OK──► return text
- *       │ 429
- *       ▼
- *   PRIMARY/gemini-2.0-flash  ──OK──► return text
- *       │ 429
- *       ▼
- *   PRIMARY/gemini-2.0-flash-lite ──OK──► return text
- *       │ 429
- *       ▼
- *   (all models exhausted)
- *       ▼
- *   throw QUOTA_EXHAUSTED
- */
 async function generateWithRoster(
   prompt: string,
   roster: ModelSlot[],
@@ -351,7 +256,6 @@ async function generateWithRoster(
   temperature = 0.7,
 ): Promise<string> {
   const slots = activeSlots(roster);
-
   for (const slot of slots) {
     try {
       const model = slot.client.getGenerativeModel({
@@ -368,28 +272,15 @@ async function generateWithRoster(
       return text;
     } catch (error: unknown) {
       if (isSkippableError(error)) {
-        // Skip this model (quota hit or not available) and try the next slot
         coolSlot(slot);
         continue;
       }
-      // Non-quota error (malformed request, network, auth, etc.) — surface immediately
       throw error;
     }
   }
-
   throw new Error('QUOTA_EXHAUSTED: All models on this roster are at quota limit. Try again shortly.');
 }
 
-/**
- * generate — primary workhorse for all generation tasks.
- *
- * Attempt order:
- *   1. primaryRoster  (GEMINI_API_KEY — 3 models in sequence)
- *   2. rerankRoster   (GEMINI_RERANK_API_KEY — cross-key fallback)
- *
- * When the primary key is fully quota-exhausted across all models,
- * the rerank key's headroom is used so requests never hard-fail.
- */
 async function generate(
   prompt: string,
   requireJson = false,
@@ -407,19 +298,10 @@ async function generate(
   }
 }
 
-// generateForRerank removed — reranking is now zero-cost (cosine sort)
-// rerankRoster is now purely a quota fallback for generate()
-
 // ============================================================================
 // ── 7. EMBEDDINGS
 // ============================================================================
 
-/**
- * Embeddings use the primary key's client directly (not model rotation —
- * the embedding model has its own separate quota and rarely hits it).
- * We always use the first slot's client since all slots share the same
- * underlying API key object on the primary roster.
- */
 async function embedText(text: string, taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_DOCUMENT'): Promise<number[]> {
   const client = primaryRoster[0].client;
   const embeddingModel = client.getGenerativeModel({ model: CONFIG.EMBEDDING_MODEL });
@@ -432,41 +314,17 @@ async function embedText(text: string, taskType: 'RETRIEVAL_QUERY' | 'RETRIEVAL_
 }
 
 const embedQuery    = (text: string) => embedText(text, 'RETRIEVAL_QUERY');
-const embedDocument = (text: string) => embedText(text, 'RETRIEVAL_DOCUMENT');
 
-// ============================================================================
-// ── 8. RAG PIPELINE HELPERS
-// ============================================================================
-
-/** Spelling correction removed — was an entire LLM call for rare benefit.
- *  The embedding model handles minor typos naturally via semantic similarity. */
-async function correctSpelling(rawQuery: string): Promise<string> {
-  return rawQuery;
-}
-
-/**
- * Single embedding — no LLM call.
- * Query expansion (4 LLM calls + 4 embeddings) was the main quota killer.
- * The embedding model alone retrieves well; expansion added marginal quality
- * at massive cost. Name kept so call sites need no changes.
- */
 async function expandAndAverageEmbedding(query: string): Promise<number[]> {
   return embedQuery(query);
 }
 
-/**
- * Rerank using the similarity scores already returned by Supabase vector search.
- * Zero LLM calls — just sort by the similarity score that pgvector already computed.
- * The LLM reranker added ~1 call per request on the rerank key; the vector scores
- * are already a strong relevance signal straight from the embedding space.
- */
 function rerankChunks(_query: string, chunks: RuleChunk[]): RuleChunk[] {
   return [...chunks]
     .sort((a, b) => b.similarity - a.similarity)
     .map(c => ({ ...c, rerank_score: c.similarity }));
 }
 
-/** Classify intent with zero LLM calls — pure keyword matching. */
 function classifyIntent(query: string): QueryIntent {
   const q = query.toLowerCase();
   if (/\b(how (wide|tall|long|thick|deep)|dimension|size|length|width|height|weight|distance|radius|diameter|mm|cm|kg|newton|force|thickness|volume|area)\b/.test(q)) return 'dimension';
@@ -476,18 +334,18 @@ function classifyIntent(query: string): QueryIntent {
   return 'general';
 }
 
-function buildSystemPrompt(intent: QueryIntent, ruleContext: string, query: string): string {
-  const base = `You are Indra, the expert AI Technical Inspector for Hexawatts Racing. Answer based ONLY on the provided regulation context. Always cite exact Rule IDs inline, e.g. [T3.14]. Do not speculate beyond the provided context.`;
+function buildSystemPrompt(intent: QueryIntent, ruleContext: string, query: string, domain: string): string {
+  const base = `You are an expert AI Technical Regulations Assistant. Answer based ONLY on the provided regulation context. Always cite exact Rule IDs inline, e.g. [T3.14]. Do not speculate beyond the provided context.`;
 
   const intentInstructions: Record<QueryIntent, string> = {
     dimension: `${base}\nThe user asks about a MEASUREMENT. Your response MUST:\n1. State the exact value with units first.\n2. List all related dimensional constraints as bullet points.\n3. Note any conditional rules or exceptions.`,
-    compliance: `${base}\nThe user asks a COMPLIANCE question. Your response MUST:\n1. Start with a clear verdict: ✅ LEGAL / ❌ ILLEGAL / ⚠️ CONDITIONAL.\n2. Cite the determining rule(s).\n3. List any specific conditions or exceptions.`,
-    definition: `${base}\nThe user wants a DEFINITION. Your response MUST:\n1. Give a concise 1–2 sentence definition.\n2. Explain its purpose in the car.\n3. Cite the defining rule.`,
-    procedure: `${base}\nThe user asks about a PROCEDURE. Your response MUST:\n1. List steps in numbered order.\n2. Highlight mandatory inspection points.\n3. Cite the relevant rule for each key step.`,
+    compliance: `${base}\nThe user asks a COMPLIANCE question. Your response MUST:\n1. Start with a clear verdict: ✅ COMPLIANT / ❌ NON-COMPLIANT / ⚠️ CONDITIONAL.\n2. Cite the determining rule(s).\n3. List any specific conditions or exceptions.`,
+    definition: `${base}\nThe user wants a DEFINITION. Your response MUST:\n1. Give a concise 1–2 sentence definition.\n2. Explain its purpose or function.\n3. Cite the defining rule.`,
+    procedure: `${base}\nThe user asks about a PROCEDURE. Your response MUST:\n1. List steps in numbered order.\n2. Highlight mandatory inspection or verification points.\n3. Cite the relevant rule for each key step.`,
     general: `${base}\nProvide a clear, structured answer. Use bullet points for multiple points. Cite rule IDs inline.`,
   };
 
-  return `${intentInstructions[intent]}\n\nREGULATION CONTEXT:\n${ruleContext}\n\nQUESTION: ${query}`;
+  return `${intentInstructions[intent]}\n\nDOMAIN: ${domain}\n\nREGULATION CONTEXT:\n${ruleContext}\n\nQUESTION: ${query}`;
 }
 
 function extractKeywordsFromQuery(query: string): string[] {
@@ -508,20 +366,9 @@ function extractKeywordsFromQuery(query: string): string[] {
   return Array.from(matched);
 }
 
-function determineHighlightMaterial(query: string, ruleIds: string[]): string | null {
-  const q = query.toLowerCase();
-  const rules = ruleIds.join(' ');
-  if (rules.includes('T3.14') || q.includes('attenuator') || q.includes(' ia ') || q.includes('ia foam')) return 'mat_ia';
-  if (rules.includes('T3.12') || rules.includes('T1.1.5') || q.includes('bulkhead')) return 'mat_bulkhead';
-  if (rules.includes('T3.13') || q.includes('anti-intrusion') || q.includes('aip')) return 'mat_aip';
-  if (rules.includes('T3.10') || q.includes('main hoop')) return 'mat_main_hoop';
-  if (rules.includes('T3.11') || q.includes('front hoop')) return 'mat_front_hoop';
-  return null;
-}
-
 function buildModelMetadata(
   model: ModelRecord,
-  highlightMaterial: string | null,
+  cadNodes: CadNodeMatch[],
   includeTags = true,
 ): Record<string, unknown> {
   return {
@@ -532,8 +379,35 @@ function buildModelMetadata(
       : [],
     description: model.description ?? null,
     fileSize: model.file_size_mb ? `${model.file_size_mb} MB` : null,
-    highlight_material: highlightMaterial,
+    cad_nodes: cadNodes.map(n => ({
+      rule_id: n.rule_id,
+      cad_node_name: n.cad_node_name,
+      relevance_score: n.relevance_score ?? null,
+    })),
   };
+}
+
+async function fetchCadNodesForRules(
+  ruleIds: string[],
+  requestId: string,
+): Promise<CadNodeMatch[]> {
+  if (ruleIds.length === 0) return [];
+
+  try {
+    const { data, error } = await supabase.rpc('match_cad_nodes_by_prefix', {
+      rule_ids: ruleIds,
+    });
+
+    if (error) {
+      logger.error('match_cad_nodes_by_prefix RPC error', error, { requestId });
+      return [];
+    }
+
+    return (data ?? []) as CadNodeMatch[];
+  } catch (err) {
+    logger.error('fetchCadNodesForRules threw', err, { requestId });
+    return [];
+  }
 }
 
 // ============================================================================
@@ -549,7 +423,6 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
     return;
   }
 
-  // Static admin token check (timing-safe)
   const validToken = process.env.API_AUTH_TOKEN!;
   const tokenBuf  = Buffer.from(token);
   const validBuf  = Buffer.from(validToken);
@@ -559,7 +432,6 @@ async function requireAuth(req: Request, res: Response, next: NextFunction): Pro
     return next();
   }
 
-  // Supabase JWT check
   try {
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) {
@@ -605,19 +477,17 @@ const generalLimiter = rateLimit({
 app.use(helmet());
 app.use(express.json({ limit: CONFIG.BODY_SIZE_LIMIT }));
 app.use(cors({
-  origin: '*', 
+  origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 // ============================================================================
 // ── 10. ROUTES
 // ============================================================================
 
-// ── Health ──────────────────────────────────────────────────────────────────
 app.get('/health', (_req: Request, res: Response): void => {
   const now = Date.now();
-
   const rosterStatus = (roster: ModelSlot[]) =>
     roster.map(s => ({
       model: s.modelName,
@@ -627,11 +497,10 @@ app.get('/health', (_req: Request, res: Response): void => {
       quotaHits: s.quotaHits,
       successCount: s.successCount,
     }));
-
   res.json({
     status: 'ok',
-    service: 'Indra Backend',
-    version: '10.1.0',
+    service: 'RAG Backend',
+    version: '11.1.0',
     uptime_seconds: Math.floor(process.uptime()),
     cache_size: semanticCache.size,
     primary_roster: rosterStatus(primaryRoster),
@@ -639,7 +508,6 @@ app.get('/health', (_req: Request, res: Response): void => {
   });
 });
 
-// ── Cache admin ──────────────────────────────────────────────────────────────
 app.get('/admin/cache', generalLimiter, requireAuth, (_req: Request, res: Response): void => {
   const now = Date.now();
   let active = 0, expired = 0;
@@ -660,7 +528,6 @@ app.post('/admin/cache/clear', generalLimiter, requireAuth, (req: Request, res: 
   res.json({ message: `Cleared ${cleared} cache entries.` });
 });
 
-// ── Key pool status ──────────────────────────────────────────────────────────
 app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response): void => {
   if ((req as AuthenticatedRequest).user?.role !== 'admin') {
     res.status(403).json({ error: 'Admin only.' });
@@ -676,7 +543,6 @@ app.get('/admin/keys', generalLimiter, requireAuth, (req: Request, res: Response
       quotaHits: s.quotaHits,
       successCount: s.successCount,
     }));
-
   res.json({
     primary_roster: rosterStatus(primaryRoster),
     rerank_roster: rosterStatus(rerankRoster),
@@ -690,7 +556,6 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
   const requestId = authReq.requestId;
   const { message, domain } = req.body as { message: unknown; domain: unknown };
 
-  // Validate input
   if (!message || typeof message !== 'string') {
     res.status(400).json({ error: 'Invalid query: message must be a non-empty string.' });
     return;
@@ -707,15 +572,13 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
   const sanitizedDomain = typeof domain === 'string' && domain.trim().length > 0
     ? domain.trim()
-    : 'Formula Bharat 2027 Full';
+    : 'General';
 
   try {
-    // Step 1: Classify intent (sync, 0 LLM calls) + embed query
     const intent = classifyIntent(trimmed);
     const expandedEmbedding = await expandAndAverageEmbedding(trimmed);
     logger.info('Query processed', { requestId, intent, domain: sanitizedDomain });
 
-    // Step 2: Cache lookup
     const cacheHit = findCacheHit(expandedEmbedding, sanitizedDomain);
     if (cacheHit) {
       logger.info('Cache hit', { requestId });
@@ -723,11 +586,10 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       return;
     }
 
-    // Step 3: Vector search
-    let queryToUse = trimmed;
-    let embedding = expandedEmbedding;
+    const embedding = expandedEmbedding;
+    const queryToUse = trimmed;
 
-    let { data: matchedRules, error: rpcError } = await supabase.rpc('match_rulebook_chunks', {
+    const { data: matchedRules, error: rpcError } = await supabase.rpc('match_rulebook_chunks', {
       query_embedding: embedding,
       match_threshold: CONFIG.MATCH_THRESHOLD,
       match_count: CONFIG.MATCH_COUNT,
@@ -736,11 +598,7 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
 
     if (rpcError) logger.error('match_rulebook_chunks RPC error', rpcError, { requestId });
 
-    const bestScore: number = (matchedRules as RuleChunk[] | null)?.[0]?.similarity ?? 0;
-
-    // Step 4: (spelling correction removed — embedding handles minor typos naturally)
-
-    // Step 5: Learned pairs + reranking in parallel
+    // Step: Learned pairs + reranking in parallel
     const [learnedMatches, rerankedRules] = await Promise.all([
       (async (): Promise<LearnedChunk[]> => {
         try {
@@ -766,7 +624,9 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       .map(r => r.rule_id)
       .filter((id): id is string => Boolean(id));
 
-    // Step 6: 3D model lookup (by rule tag, then by keyword category)
+    // ─────────────────────────────────────────────────────────────────────
+    // 3D model + CAD node lookup.
+    // ─────────────────────────────────────────────────────────────────────
     let topModel: ModelRecord | null = null;
 
     if (hasRuleMatches && ruleIds.length > 0) {
@@ -797,29 +657,48 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
       }
     }
 
-    const highlightMaterial = determineHighlightMaterial(queryToUse, ruleIds);
+    // Prefix-match CAD node names for the 3D viewer
+    const cadNodes = await fetchCadNodesForRules(ruleIds, requestId);
 
-    // Step 7: No results path
+    // ─────────────────────────────────────────────────────────────────────
+    // 🌟 ENHANCED: Generic LLM Fallback (No Rules Found)
+    // ─────────────────────────────────────────────────────────────────────
     if (!hasRuleMatches && !hasLearnedMatches) {
+      logger.info('No specific rules found, engaging Generic Engineering Response.', { requestId });
+
+      const genericPrompt = `You are an expert AI Technical Assistant. The user asked a question that is NOT explicitly covered in the "${sanitizedDomain}" regulations we have on file. 
+      
+      Provide a helpful, standard engineering or technical response to their query. 
+      CRITICAL: You MUST explicitly state at the beginning or end of your response that this is "General Advice" and NOT an official rulebook citation.
+
+      QUESTION: ${queryToUse}`;
+
+      // slightly higher temp (0.6) for standard problem solving
+      const genericAnswer = await generate(genericPrompt, false, 0.6); 
+
       await saveLog({
         request_id: requestId, query: trimmed,
-        result: 'no_match', domain: sanitizedDomain, intent,
+        result: 'no_match_fallback', domain: sanitizedDomain, intent: 'general_engineering',
         created_at: new Date().toISOString(),
       });
-      const fallback: Record<string, unknown> = {
-        answer: `I couldn't find a specific regulation matching your question in the ${sanitizedDomain} rulebook. Please try rephrasing, or check if this rule applies to a different domain.`,
+
+      const fallbackPayload: Record<string, unknown> = {
+        answer: genericAnswer,
         citations: [],
-        intent,
+        intent: 'general_engineering',
       };
+
       if (topModel?.file_url) {
-        fallback.model_url = topModel.file_url;
-        fallback.model_metadata = buildModelMetadata(topModel, highlightMaterial, false);
+        fallbackPayload.model_url      = topModel.file_url;
+        fallbackPayload.model_metadata = buildModelMetadata(topModel, cadNodes, false);
+        fallbackPayload.cad_nodes      = cadNodes;
       }
-      res.json(fallback);
+
+      res.json(fallbackPayload);
       return;
     }
 
-    // Step 8: Build context and generate final answer
+    // Build context and generate final answer (Strict Rule-Based)
     const ruleContext = [
       ...rerankedRules.map(r =>
         `[Rule ${r.rule_id}${r.rerank_score !== undefined ? ` | Relevance: ${r.rerank_score.toFixed(2)}` : ''}]\n${r.content}`
@@ -830,17 +709,17 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
         : []),
     ].join('\n\n---\n\n');
 
-    const systemPrompt = buildSystemPrompt(intent, ruleContext, queryToUse);
+    const systemPrompt = buildSystemPrompt(intent, ruleContext, queryToUse, sanitizedDomain);
     const answer = await generate(systemPrompt, false, 0.35);
 
-    // Step 9: Assemble response
+    // Assemble response
     const responsePayload: Record<string, unknown> = {
       answer,
       intent,
       citations: rerankedRules.map(r => ({
-        rule_id: r.rule_id,
-        content: r.content,
-        similarity: r.similarity,
+        rule_id:      r.rule_id,
+        content:      r.content,
+        similarity:   r.similarity,
         rerank_score: r.rerank_score ?? null,
       })),
     };
@@ -848,48 +727,51 @@ app.post('/ask_indra', askLimiter, requireAuth, async (req: Request, res: Respon
     if (hasLearnedMatches) {
       responsePayload.learned_citations = learnedMatches.map(l => ({
         question: l.question,
-        answer: l.answer,
-        source: l.source,
+        answer:   l.answer,
+        source:   l.source,
       }));
     }
 
     if (topModel?.file_url) {
-      responsePayload.model_url = topModel.file_url;
-      responsePayload.model_metadata = buildModelMetadata(topModel, highlightMaterial);
+      responsePayload.model_url      = topModel.file_url;
+      responsePayload.model_metadata = buildModelMetadata(topModel, cadNodes);
     }
+
+    responsePayload.cad_nodes = cadNodes;
 
     writeCache(expandedEmbedding, sanitizedDomain, responsePayload);
 
     await saveLog({
-      request_id: requestId,
-      query: trimmed,
-      corrected_query: queryToUse !== trimmed ? queryToUse : null,
-      result: 'success',
-      domain: sanitizedDomain,
+      request_id:              requestId,
+      query:                   trimmed,
+      corrected_query:         queryToUse !== trimmed ? queryToUse : null,
+      result:                  'success',
+      domain:                  sanitizedDomain,
       intent,
-      model_found: !!topModel,
-      model_name: topModel?.name ?? null,
-      citations_count: rerankedRules.length,
+      model_found:             !!topModel,
+      model_name:              topModel?.name ?? null,
+      citations_count:         rerankedRules.length,
       learned_citations_count: learnedMatches.length,
-      cache_written: true,
-      created_at: new Date().toISOString(),
+      cad_nodes_count:         cadNodes.length,
+      cache_written:           true,
+      created_at:              new Date().toISOString(),
     });
 
     res.json(responsePayload);
 
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
-    const isQuotaExhausted = msg.toLowerCase().includes('quota-exhausted');
+    const isQuotaExhausted = msg.toLowerCase().includes('quota_exhausted');
 
     logger.error('Error in /ask_indra', error, { requestId });
 
     if (isQuotaExhausted) {
       res.status(503).json({
         error: 'All AI capacity is temporarily at quota limit. Please try again in a minute.',
-        code: 'QUOTA_EXHAUSTED',
+        code:  'QUOTA_EXHAUSTED',
       });
     } else {
-      res.status(500).json({ error: 'Indra encountered an error. Please try again.' });
+      res.status(500).json({ error: 'The server encountered an error. Please try again.' });
     }
   }
 });
@@ -902,7 +784,7 @@ app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Res
 
   if (
     !question || typeof question !== 'string' || question.trim().length < 2 ||
-    !answer   || typeof answer   !== 'string' || answer.trim().length < 2 ||
+    !answer   || typeof answer   !== 'string' || answer.trim().length < 2   ||
     !domain   || typeof domain   !== 'string' ||
     !['good', 'bad'].includes(rating as string)
   ) {
@@ -919,7 +801,7 @@ app.post('/feedback', generalLimiter, requireAuth, async (req: Request, res: Res
     res.json({
       message: rating === 'good'
         ? 'Answer learned — thanks for the signal!'
-        : 'Feedback noted. We will improve.',
+        : 'Feedback noted. We will work to improve.',
     });
   } catch (err) {
     logger.error('Feedback save error', err);
@@ -948,12 +830,7 @@ app.get('/models', generalLimiter, requireAuth, async (req: Request, res: Respon
       .range(parsedOffset, parsedOffset + parsedLimit - 1);
 
     if (error) throw error;
-
-    res.json({
-      models: data,
-      total: count,
-      has_more: count ? count > parsedOffset + parsedLimit : false,
-    });
+    res.json({ models: data, total: count, has_more: count ? count > parsedOffset + parsedLimit : false });
   } catch (err) {
     logger.error('Error fetching models', err);
     res.status(500).json({ error: 'Failed to fetch model library.' });
@@ -962,12 +839,10 @@ app.get('/models', generalLimiter, requireAuth, async (req: Request, res: Respon
 
 app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
-  // Allow UUIDs or integer IDs
   if (!/^[\w-]+$/.test(id)) {
     res.status(400).json({ error: 'Invalid model ID.' });
     return;
   }
-
   try {
     const { data, error } = await supabase
       .from('fb_models')
@@ -986,18 +861,17 @@ app.get('/models/:id', generalLimiter, requireAuth, async (req: Request, res: Re
   }
 });
 
-// ── Quiz generation (dynamic, not hardcoded) ─────────────────────────────────
+// ── Quiz generation ──────────────────────────────────────────────────────────
 app.get('/quiz', generalLimiter, requireAuth, async (req: Request, res: Response): Promise<void> => {
-  const { domain = 'Formula Bharat 2027 Full', count = '3' } = req.query;
+  const { domain = 'General', count = '3' } = req.query;
   const questionCount = Math.min(Math.max(Number(count) || 3, 1), 10);
 
   try {
-    // Fetch some random rule chunks to base quiz questions on
     const { data: chunks } = await supabase
       .from('rulebook_chunks')
       .select('rule_id, content')
       .eq('domain', domain as string)
-      .limit(questionCount * 3); // fetch more, let LLM pick the best ones
+      .limit(questionCount * 3);
 
     if (!chunks || chunks.length === 0) {
       res.status(404).json({ error: 'No rulebook content found for this domain.' });
@@ -1005,9 +879,10 @@ app.get('/quiz', generalLimiter, requireAuth, async (req: Request, res: Response
     }
 
     const context = chunks.map(c => `[${c.rule_id}] ${c.content}`).join('\n\n');
-    const prompt = `You are a Formula Bharat technical examiner. Based on the regulation excerpts below, generate exactly ${questionCount} multiple-choice quiz questions. Each question must test specific technical knowledge from the rules.
+    const prompt = `You are a technical regulations examiner. Based on the regulation excerpts below, generate exactly ${questionCount} multiple-choice quiz questions. Each question must test specific technical knowledge from the rules.
 
 Return ONLY a JSON array with this exact structure (no markdown, no explanation):
+
 [
   {
     "question": "...",
@@ -1023,12 +898,11 @@ correctAnswer is the 0-based index of the correct option.
 REGULATION EXCERPTS:
 ${context}`;
 
-    const raw = await generate(prompt, true, 0.4);
-    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const raw      = await generate(prompt, true, 0.4);
+    const cleaned  = raw.replace(/```json|```/g, '').trim();
     const questions = JSON.parse(cleaned);
 
     if (!Array.isArray(questions)) throw new Error('Invalid quiz generation response');
-
     res.json({ questions, domain, generated: true });
   } catch (err) {
     logger.error('Quiz generation error', err);
@@ -1044,7 +918,6 @@ app.use((_req: Request, res: Response): void => {
   res.status(404).json({ error: 'Route not found.' });
 });
 
-// Express 4 error handler — must have 4 params
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void => {
   logger.error('Unhandled error', error);
@@ -1052,12 +925,13 @@ app.use((error: Error, _req: Request, res: Response, _next: NextFunction): void 
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🏁  Indra Backend v10.1.0`);
+  console.log(`\n🚀  RAG Backend v11.1.0`);
   console.log(`🌐  http://localhost:${PORT}`);
   console.log(`🌍  Environment  : ${IS_PROD ? 'PRODUCTION' : 'development'}`);
   console.log(`🛡️   Security     : Helmet + Rate Limiting + Timing-Safe Auth`);
   console.log(`🔑  Primary key  : ${primaryRoster.length} models (${primaryRoster.map(s => s.modelName).join(' → ')})`);
   console.log(`🔑  Rerank key   : ${rerankRoster.length} models (dedicated, fallback to primary)`);
-  console.log(`🧠  RAG Engine   : Query expansion → Vector search → LLM Rerank → Generation`);
-  console.log(`⚡  Cache        : Semantic in-memory (TTL: ${CONFIG.CACHE_TTL_MS / 60000}min)\n`);
+  console.log(`🧠  RAG Engine   : Vector search → Cosine Rerank → Prefix CAD Match → Generic Fallback`);
+  console.log(`⚡  Cache        : Semantic in-memory (TTL: ${CONFIG.CACHE_TTL_MS / 60000}min)`);
+  console.log(`🔩  CAD Nodes    : Prefix-match rule linking enabled\n`);
 });
